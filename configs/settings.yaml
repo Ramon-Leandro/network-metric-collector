@@ -1,0 +1,6 @@
+settings:
+  interval: 10
+  targets:
+    - "https://google.com"
+    - "https://github.com"
+    - "https://cloudflare.com"
