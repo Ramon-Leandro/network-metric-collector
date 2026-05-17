@@ -1,38 +1,60 @@
 package main
 
 import (
+	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/youruser/network-metric-collector/internal/config"
-	"github.com/youruser/network-metric-collector/internal/monitor"
+	"github.com/Ramon-Leandro/network-metric-collector/internal/config"
+	"github.com/Ramon-Leandro/network-metric-collector/internal/monitor"
 )
 
 func main() {
-	// Loading configuration at startup to ensure environment consistency
 	cfg, err := config.LoadConfig("configs/settings.yaml")
 	if err != nil {
 		log.Fatalf("Critical failure: could not load configuration: %v", err)
 	}
 
-	log.Printf("Starting collector with %d targets...", len(cfg.Settings.Targets))
+	log.Printf("Starting professional collector with %d targets...", len(cfg.Settings.Targets))
 
-	// Ticker ensures precise execution intervals regardless of task duration
+	// Base context that will be canceled when the OS sends a termination signal.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Listening to OS signals asynchronously.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
 	ticker := time.NewTicker(time.Duration(cfg.Settings.Interval) * time.Second)
+	defer ticker.Stop()
 
+	// Goroutine responsible for handling the graceful shutdown orchestration.
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal %v. Initiating graceful shutdown...", sig)
+		cancel() // Triggers cancellation across all context-aware routines
+	}()
+
+	// Execution loop
 	for {
 		select {
 		case <-ticker.C:
-			runCheck(cfg.Settings.Targets)
+			// Spawning the checks. If the context is already canceled, 
+			// they will return instantly.
+			runCheck(ctx, cfg.Settings.Targets)
+		case <-ctx.Done():
+			// Ensuring the loop breaks cleanly when the shutdown process finishes.
+			log.Println("Collector stopped successfully. Exiting clean.")
+			return
 		}
 	}
 }
 
-// runCheck orchestrates the concurrent execution of network probes.
-func runCheck(targets []string) {
+func runCheck(ctx context.Context, targets []string) {
 	for _, target := range targets {
-		// Spawning a goroutine per target allows concurrent latency checks,
-		// preventing a slow endpoint from bottlenecking the entire pipeline.
-		go monitor.CheckTarget(target)
+		go monitor.CheckTarget(ctx, target)
 	}
 }
