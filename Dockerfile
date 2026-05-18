@@ -1,5 +1,5 @@
 # Step 1: Build stage
-FROM golang:1.22-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 # Install git for private modules if necessary
 RUN apk add --no-cache git
@@ -25,7 +25,7 @@ WORKDIR /root/
 
 # Copy the binary from the builder stage
 COPY --from=builder /app/collector .
-COPY --from=builder /app/configs/settings.yaml ./configs/
+COPY --from=builder /app/configs/ ./configs/
 
 # Running as a non-privileged user is a security best practice
 ENTRYPOINT ["./collector"]

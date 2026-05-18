@@ -2,25 +2,42 @@ package monitor
 
 import (
 	"context"
-	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// CheckTarget performs a concurrent network probe against a specific URL.
-// It accepts a context to allow premature cancellation from the main lifecycle.
-func CheckTarget(ctx context.Context, url string) {
+var (
+	HttpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "network_collector_requests_total",
+			Help: "The total number of network probes executed by the collector.",
+		},
+		[]string{"target", "status"},
+	)
+
+	// Upgraded from GaugeVec to HistogramVec to capture latency percentiles (P50, P99)
+	HttpLatencyHistogram = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "network_collector_latency_seconds",
+			Help:    "The network response latency distribution in fractional seconds.",
+			Buckets: prometheus.DefBuckets, // Standard system buckets ranging from 5ms to 10s
+		},
+		[]string{"target"},
+	)
+)
+
+func CheckTarget(ctx context.Context, client *http.Client, url string) {
 	start := time.Now()
 
-	// Using a custom client to avoid the global http.DefaultClient bottleneck.
-	client := http.Client{
-		Timeout: 5 * time.Second,
-	}
-
-	// Creating a request bound to the application lifetime context.
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		fmt.Printf("[ERROR] Failed to create request for %s: %v\n", url, err)
+		slog.Error("failed to create network request", "target", url, "error", err.Error())
 		return
 	}
 
@@ -28,15 +45,31 @@ func CheckTarget(ctx context.Context, url string) {
 	duration := time.Since(start)
 
 	if err != nil {
-		// Checking if the error was due to an intentional context cancellation.
 		if ctx.Err() == context.Canceled {
-			fmt.Printf("[INFO] Probe for %s aborted due to shutdown signal\n", url)
+			slog.Info("probe aborted due to shutdown signal", "target", url)
 			return
 		}
-		fmt.Printf("[ERROR] Target %s is unreachable: %v\n", url, err)
+		slog.Error("target is unreachable", "target", url, "error", err.Error())
+		HttpRequestsTotal.WithLabelValues(url, "error").Inc()
 		return
 	}
-	defer resp.Body.Close()
+	
+	// Crucial structural change: Drain the network stream before closing it.
+	// This signals Go's runtime that the TCP socket connection can be safely returned 
+	// to the Keep-Alive pool instead of destroying it.
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
-	fmt.Printf("[METRIC] Target: %s | Status: %d | Latency: %v\n", url, resp.StatusCode, duration)
+	statusCodeStr := strconv.Itoa(resp.StatusCode)
+
+	HttpRequestsTotal.WithLabelValues(url, statusCodeStr).Inc()
+	HttpLatencyHistogram.WithLabelValues(url).Observe(duration.Seconds()) // Observe into distribution buckets
+
+	slog.Info("network metric collected", 
+		"target", url, 
+		"status", resp.StatusCode, 
+		"latency_ms", duration.Milliseconds(),
+	)
 }
