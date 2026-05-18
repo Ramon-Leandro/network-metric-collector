@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -11,8 +12,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Defining professional Prometheus metrics vectors. 
-// We use vector types to safely inject dynamic labels like 'target' and 'status'.
 var (
 	HttpRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -22,21 +21,20 @@ var (
 		[]string{"target", "status"},
 	)
 
-	HttpLatencyGauge = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "network_collector_latency_seconds",
-			Help: "The network response latency measured in fractional seconds.",
+	// Upgraded from GaugeVec to HistogramVec to capture latency percentiles (P50, P99)
+	HttpLatencyHistogram = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "network_collector_latency_seconds",
+			Help:    "The network response latency distribution in fractional seconds.",
+			Buckets: prometheus.DefBuckets, // Standard system buckets ranging from 5ms to 10s
 		},
 		[]string{"target"},
 	)
 )
 
-// CheckTarget performs a concurrent network probe using a scoped HTTP GET method.
-// It records structural execution telemetry directly into the Prometheus registry.
 func CheckTarget(ctx context.Context, client *http.Client, url string) {
 	start := time.Now()
 
-	// Switching to GET ensures compatibility with servers rejecting HEAD commands.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		slog.Error("failed to create network request", "target", url, "error", err.Error())
@@ -55,15 +53,19 @@ func CheckTarget(ctx context.Context, client *http.Client, url string) {
 		HttpRequestsTotal.WithLabelValues(url, "error").Inc()
 		return
 	}
-	// Instantly discarding body streams to prevent kernel memory socket allocation leaks
-	defer resp.Body.Close()
+	
+	// Crucial structural change: Drain the network stream before closing it.
+	// This signals Go's runtime that the TCP socket connection can be safely returned 
+	// to the Keep-Alive pool instead of destroying it.
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
-	// Parse values into structural string metrics labels
 	statusCodeStr := strconv.Itoa(resp.StatusCode)
 
-	// Update Prometheus vectors safely across parallel threads
 	HttpRequestsTotal.WithLabelValues(url, statusCodeStr).Inc()
-	HttpLatencyGauge.WithLabelValues(url).Set(duration.Seconds())
+	HttpLatencyHistogram.WithLabelValues(url).Observe(duration.Seconds()) // Observe into distribution buckets
 
 	slog.Info("network metric collected", 
 		"target", url, 
