@@ -2,25 +2,44 @@ package monitor
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// CheckTarget performs a concurrent network probe against a specific URL.
-// It accepts a context to allow premature cancellation from the main lifecycle.
-func CheckTarget(ctx context.Context, url string) {
+// Defining professional Prometheus metrics vectors. 
+// We use vector types to safely inject dynamic labels like 'target' and 'status'.
+var (
+	HttpRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "network_collector_requests_total",
+			Help: "The total number of network probes executed by the collector.",
+		},
+		[]string{"target", "status"},
+	)
+
+	HttpLatencyGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "network_collector_latency_seconds",
+			Help: "The network response latency measured in fractional seconds.",
+		},
+		[]string{"target"},
+	)
+)
+
+// CheckTarget performs a concurrent network probe using a scoped HTTP GET method.
+// It records structural execution telemetry directly into the Prometheus registry.
+func CheckTarget(ctx context.Context, client *http.Client, url string) {
 	start := time.Now()
 
-	// Using a custom client to avoid the global http.DefaultClient bottleneck.
-	client := http.Client{
-		Timeout: 5 * time.Second,
-	}
-
-	// Creating a request bound to the application lifetime context.
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	// Switching to GET ensures compatibility with servers rejecting HEAD commands.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		fmt.Printf("[ERROR] Failed to create request for %s: %v\n", url, err)
+		slog.Error("failed to create network request", "target", url, "error", err.Error())
 		return
 	}
 
@@ -28,15 +47,27 @@ func CheckTarget(ctx context.Context, url string) {
 	duration := time.Since(start)
 
 	if err != nil {
-		// Checking if the error was due to an intentional context cancellation.
 		if ctx.Err() == context.Canceled {
-			fmt.Printf("[INFO] Probe for %s aborted due to shutdown signal\n", url)
+			slog.Info("probe aborted due to shutdown signal", "target", url)
 			return
 		}
-		fmt.Printf("[ERROR] Target %s is unreachable: %v\n", url, err)
+		slog.Error("target is unreachable", "target", url, "error", err.Error())
+		HttpRequestsTotal.WithLabelValues(url, "error").Inc()
 		return
 	}
+	// Instantly discarding body streams to prevent kernel memory socket allocation leaks
 	defer resp.Body.Close()
 
-	fmt.Printf("[METRIC] Target: %s | Status: %d | Latency: %v\n", url, resp.StatusCode, duration)
+	// Parse values into structural string metrics labels
+	statusCodeStr := strconv.Itoa(resp.StatusCode)
+
+	// Update Prometheus vectors safely across parallel threads
+	HttpRequestsTotal.WithLabelValues(url, statusCodeStr).Inc()
+	HttpLatencyGauge.WithLabelValues(url).Set(duration.Seconds())
+
+	slog.Info("network metric collected", 
+		"target", url, 
+		"status", resp.StatusCode, 
+		"latency_ms", duration.Milliseconds(),
+	)
 }
